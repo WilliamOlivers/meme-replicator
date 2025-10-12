@@ -47,7 +47,7 @@ Visit: [https://meme-replicator.oliverpartridge.workers.dev/](https://meme-repli
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/YOUR_USERNAME/meme-replicator.git
+   git clone https://github.com/WilliamOlivers/meme-replicator.git
    cd meme-replicator
    ```
 
@@ -164,7 +164,7 @@ MIT License - feel free to use this project for your own purposes.
 
 ## 📧 Contact
 
-Created by Oliver Partridge - [your-email@example.com](mailto:your-email@example.com)
+Project Link: [https://github.com/WilliamOlivers/meme-replicator](https://github.com/WilliamOlivers/meme-replicator)
 
 ---
 
