@@ -1,0 +1,19 @@
+name = "meme-replicator"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "meme-replicator"
+database_id = "289daca3-fc68-4823-9685-3f6d255c1b1d"
+
+
+[vars]
+SITE_URL = "https://meme-replicator.oliverpartridge.workers.dev/"
+FROM_EMAIL = "onboarding@resend.dev"
+
+# Note: Using Resend's test email for now. This works without verification.
+# You still need to set RESEND_API_KEY secret if you want login to work:
+# wrangler secret put RESEND_API_KEY
+# 
+# But you can view memes WITHOUT logging in - login is only needed to submit/interact

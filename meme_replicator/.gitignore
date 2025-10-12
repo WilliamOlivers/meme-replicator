@@ -1,0 +1,31 @@
+# Wrangler
+.wrangler/
+wrangler.toml.bak
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables
+.env
+.dev.vars
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Database backups
+*.db-backup
+*.sqlite-backup
