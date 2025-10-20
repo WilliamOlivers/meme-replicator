@@ -96,8 +96,19 @@ async function getUserFromRequest(request, env) {
     
     // Verify user still exists
     const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(sessionData.userId).first();
-    
-    return user || null;
+
+    if (!user) return null;
+
+    if (!user.username) {
+      const username = await generateUsername(env);
+      await env.DB.prepare('UPDATE users SET username = ? WHERE id = ?')
+        .bind(username, user.id)
+        .run();
+      user.username = username;
+    }
+
+    user.sessionData = sessionData;
+    return user;
   } catch (error) {
     return null;
   }
@@ -133,7 +144,18 @@ async function handleAPI(request, env, path) {
     
     if (path === '/api/auth/user' && request.method === 'GET') {
       const user = await getUserFromRequest(request, env);
-      return new Response(JSON.stringify({ user }), { headers: corsHeaders });
+      const headers = { ...corsHeaders };
+
+      if (user && (!user.sessionData?.username || user.sessionData.username !== user.username)) {
+        const sessionDetails = buildSessionCookie(user);
+        headers['Set-Cookie'] = sessionDetails.header;
+      }
+
+      if (user && user.sessionData) {
+        delete user.sessionData;
+      }
+
+      return new Response(JSON.stringify({ user }), { headers });
     }
     
     if (path === '/api/auth/logout' && request.method === 'POST') {
@@ -148,10 +170,97 @@ async function handleAPI(request, env, path) {
     // Get current user for protected endpoints
     const currentUser = await getUserFromRequest(request, env);
     
+    if (path === '/api/profile' && request.method === 'GET') {
+      if (!currentUser) {
+        return new Response(JSON.stringify({ error: 'Authentication required' }), {
+          status: 401,
+          headers: corsHeaders
+        });
+      }
+
+      const profile = {
+        email: currentUser.email,
+        username: currentUser.username,
+        name: currentUser.name
+      };
+
+      return new Response(JSON.stringify({ profile }), { headers: corsHeaders });
+    }
+
+    if (path === '/api/profile' && request.method === 'PUT') {
+      if (!currentUser) {
+        return new Response(JSON.stringify({ error: 'Authentication required' }), {
+          status: 401,
+          headers: corsHeaders
+        });
+      }
+
+      const body = await request.json();
+      const rawUsername = typeof body.username === 'string' ? body.username.trim() : '';
+
+      if (!rawUsername) {
+        return new Response(JSON.stringify({ error: 'Username is required' }), {
+          status: 400,
+          headers: corsHeaders
+        });
+      }
+
+      const normalized = rawUsername.toLowerCase();
+      const pattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+      if (normalized.length < 3 || normalized.length > 32 || !pattern.test(normalized)) {
+        return new Response(JSON.stringify({ error: 'Username must be 3-32 characters, lowercase letters, numbers, and single hyphens only' }), {
+          status: 400,
+          headers: corsHeaders
+        });
+      }
+
+      if (currentUser.username === normalized) {
+        const sessionDetails = buildSessionCookie(currentUser);
+        return new Response(JSON.stringify({ profile: {
+          email: currentUser.email,
+          username: currentUser.username,
+          name: currentUser.name
+        } }), {
+          headers: {
+            ...corsHeaders,
+            'Set-Cookie': sessionDetails.header
+          }
+        });
+      }
+
+      const existing = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(normalized).first();
+
+      if (existing && existing.id !== currentUser.id) {
+        return new Response(JSON.stringify({ error: 'Username already taken' }), {
+          status: 409,
+          headers: corsHeaders
+        });
+      }
+
+      await env.DB.prepare('UPDATE users SET username = ? WHERE id = ?')
+        .bind(normalized, currentUser.id)
+        .run();
+
+      const updatedUser = { ...currentUser, username: normalized };
+      const sessionDetails = buildSessionCookie(updatedUser);
+
+      return new Response(JSON.stringify({ profile: {
+        email: updatedUser.email,
+        username: updatedUser.username,
+        name: updatedUser.name
+      } }), {
+        headers: {
+          ...corsHeaders,
+          'Set-Cookie': sessionDetails.header
+        }
+      });
+    }
+
     if (path === '/api/memes' && request.method === 'GET') {
       // Get all memes with interactions
       const memes = await env.DB.prepare(`
-        SELECT m.*, u.name as author_name, u.email as author_email, COUNT(i.id) as interaction_count
+        SELECT m.*, u.name as author_name, u.email as author_email, u.username as author_username, COUNT(i.id) as interaction_count
         FROM memes m
         LEFT JOIN users u ON m.user_id = u.id
         LEFT JOIN interactions i ON m.id = i.meme_id
@@ -162,7 +271,7 @@ async function handleAPI(request, env, path) {
       // Get interactions for each meme
       for (let meme of memes.results) {
         const interactions = await env.DB.prepare(`
-          SELECT i.*, u.name as user_name 
+          SELECT i.*, u.name as user_name, u.username as user_username 
           FROM interactions i
           LEFT JOIN users u ON i.user_id = u.id
           WHERE i.meme_id = ? 
@@ -186,11 +295,13 @@ async function handleAPI(request, env, path) {
         return new Response(JSON.stringify({ error: 'Content is required' }), 
           { status: 400, headers: corsHeaders });
       }
+
+      const authorLabel = currentUser.username ? '@' + currentUser.username : (currentUser.name || currentUser.email);
       
       const result = await env.DB.prepare(`
         INSERT INTO memes (content, author, user_id, score, created_at)
         VALUES (?, ?, ?, 100, datetime('now'))
-      `).bind(content.trim(), currentUser.name || currentUser.email, currentUser.id).run();
+      `).bind(content.trim(), authorLabel, currentUser.id).run();
       
       return new Response(JSON.stringify({ 
         success: true, 
@@ -416,21 +527,33 @@ async function upsertAuth0User(auth0User, env) {
     .first();
 
   if (!user) {
+    const username = await generateUsername(env);
     const result = await env.DB.prepare(`
-      INSERT INTO users (email, name, created_at)
-      VALUES (?, ?, datetime('now'))
-    `).bind(auth0User.email, preferredName).run();
+      INSERT INTO users (email, name, username, created_at)
+      VALUES (?, ?, ?, datetime('now'))
+    `).bind(auth0User.email, preferredName, username).run();
 
     user = {
       id: result.meta.last_row_id,
       email: auth0User.email,
-      name: preferredName
+      name: preferredName,
+      username
     };
-  } else if (!user.name && preferredName) {
-    await env.DB.prepare('UPDATE users SET name = ? WHERE id = ?')
-      .bind(preferredName, user.id)
-      .run();
-    user.name = preferredName;
+  } else {
+    if (!user.name && preferredName) {
+      await env.DB.prepare('UPDATE users SET name = ? WHERE id = ?')
+        .bind(preferredName, user.id)
+        .run();
+      user.name = preferredName;
+    }
+
+    if (!user.username) {
+      const username = await generateUsername(env);
+      await env.DB.prepare('UPDATE users SET username = ? WHERE id = ?')
+        .bind(username, user.id)
+        .run();
+      user.username = username;
+    }
   }
 
   await env.DB.prepare('UPDATE users SET last_login = datetime("now") WHERE id = ?')
@@ -440,12 +563,13 @@ async function upsertAuth0User(auth0User, env) {
   return user;
 }
 
-function buildSessionCookie(user, auth0User) {
+function buildSessionCookie(user, auth0User = null) {
   const displayName = user.name || auth0User?.name || auth0User?.nickname || user.email;
   const sessionData = {
     userId: user.id,
     email: user.email,
     name: displayName,
+    username: user.username,
     auth0Sub: auth0User?.sub,
     exp: Date.now() + (30 * 24 * 60 * 60 * 1000)
   };
@@ -458,6 +582,32 @@ function buildSessionCookie(user, auth0User) {
     header: `session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSeconds}`
   };
 }
+
+  async function generateUsername(env, maxAttempts = 25) {
+    const adjectives = [
+      'curious', 'bold', 'clever', 'lively', 'radiant', 'vivid', 'brisk', 'lucid', 'noble', 'brave'
+    ];
+    const nouns = [
+      'aurora', 'comet', 'nebula', 'quark', 'vector', 'cipher', 'vertex', 'lyric', 'signal', 'riddle'
+    ];
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const adjective = adjectives[Math.floor(Math.random() * adjectives.length)];
+      const noun = nouns[Math.floor(Math.random() * nouns.length)];
+      const suffix = Math.floor(100 + Math.random() * 900);
+      const candidate = `${adjective}-${noun}-${suffix}`;
+
+      const existing = await env.DB.prepare('SELECT id FROM users WHERE username = ?')
+        .bind(candidate)
+        .first();
+
+      if (!existing) {
+        return candidate;
+      }
+    }
+
+    throw new Error('Unable to generate unique username');
+  }
 
 function decodeIdToken(idToken) {
   try {
@@ -550,17 +700,54 @@ function getHTML() {
             display: block;
         }
         
-        .user-info {
-            background: white;
-            border: 2px solid #388e3c;
-            padding: 15px;
-            margin-bottom: 30px;
-            display: none;
-        }
+    .user-info {
+      background: white;
+      border: 2px solid #388e3c;
+      padding: 15px;
+      margin-bottom: 30px;
+      display: none;
+      justify-content: space-between;
+      align-items: center;
+      gap: 15px;
+      flex-wrap: wrap;
+    }
         
-        .user-info.show {
-            display: block;
+    .user-info.show {
+      display: flex;
         }
+
+    .user-summary {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .profile-handle {
+      font-size: 14px;
+      color: #1976d2;
+    }
+
+    .profile-handle.missing {
+      color: #d32f2f;
+    }
+
+    .user-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .edit-profile {
+      background: transparent;
+      border: 1px solid #333;
+      color: #333;
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+        
+    .edit-profile:hover {
+      background: #f0f0f0;
+    }
         
         .meme-form {
             background: white;
@@ -615,6 +802,50 @@ function getHTML() {
             padding: 5px 10px;
             font-size: 12px;
         }
+
+    .profile-editor {
+      background: white;
+      border: 2px solid #1976d2;
+      padding: 20px;
+      margin-bottom: 30px;
+      display: none;
+    }
+
+    .profile-editor.show {
+      display: block;
+    }
+
+    .profile-editor h4 {
+      margin-top: 0;
+      margin-bottom: 10px;
+    }
+
+    .profile-editor label {
+      font-size: 12px;
+      font-weight: bold;
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    .profile-editor input[type="text"] {
+      width: 220px;
+      border: 1px solid #333;
+      padding: 8px 10px;
+      font-family: inherit;
+      margin-bottom: 10px;
+    }
+
+    .profile-controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .profile-hint {
+      font-size: 12px;
+      color: #666;
+      margin: 0;
+    }
         
         .meme-list {
             background: white;
@@ -762,10 +993,29 @@ function getHTML() {
     </div>
     
     <!-- User Info Section -->
-    <div id="userInfo" class="user-info">
-        <span id="userEmail"></span>
-        <button class="logout" onclick="logout()">LOGOUT</button>
+  <div id="userInfo" class="user-info">
+    <div class="user-summary">
+      <div id="userEmail"></div>
+      <div id="userHandle" class="profile-handle"></div>
     </div>
+    <div class="user-actions">
+      <button class="edit-profile" onclick="toggleProfileEditor(true)">EDIT PROFILE</button>
+      <button class="logout" onclick="logout()">LOGOUT</button>
+    </div>
+  </div>
+
+  <div id="profileEditor" class="profile-editor">
+    <h4>Profile</h4>
+    <label for="usernameInput">Username</label>
+    <input type="text" id="usernameInput" maxlength="32" placeholder="lowercase-handle">
+    <div id="profileMessage"></div>
+    <div class="profile-controls">
+      <button id="saveUsernameBtn" onclick="saveUsername()">SAVE</button>
+      <button onclick="toggleProfileEditor(false)">CANCEL</button>
+      <button id="suggestUsernameBtn" onclick="suggestUsername()">RANDOMIZE</button>
+    </div>
+    <p class="profile-hint">Usernames use lowercase letters, numbers, and single hyphens.</p>
+  </div>
     
     <div class="meme-form">
         <h3>Submit a Meme (Idea)</h3>
@@ -795,10 +1045,21 @@ function getHTML() {
     </div>
 
     <script>
-        let memes = [];
-        let currentSort = 'score';
-        let currentUser = null;
-  let pendingEmail = null;
+    let memes = [];
+    let currentSort = 'score';
+    let currentUser = null;
+    let pendingEmail = null;
+    let profileEditorOpen = false;
+
+    const usernameAdjectives = [
+      'curious', 'bold', 'clever', 'lively', 'radiant', 'vivid', 'brisk', 'lucid', 'noble', 'brave',
+      'keen', 'mirthful', 'orbiting', 'spry', 'focal', 'stellar', 'mystic', 'quiet', 'restless', 'sage'
+    ];
+
+    const usernameNouns = [
+      'aurora', 'comet', 'nebula', 'quark', 'vector', 'cipher', 'vertex', 'lyric', 'signal', 'riddle',
+      'lemma', 'paradox', 'chorus', 'atlas', 'glyph', 'spark', 'syllable', 'fractal', 'zephyr', 'ember'
+    ];
         
         // Load initial state
         checkAuthAndLoad();
@@ -829,9 +1090,14 @@ function getHTML() {
         function showUserInterface() {
             document.getElementById('authSection').classList.remove('show');
             document.getElementById('userInfo').classList.add('show');
-            document.getElementById('userEmail').textContent = 'Logged in as: ' + (currentUser.name || currentUser.email);
+      updateUserSummary();
             document.getElementById('loginPrompt').style.display = 'none';
             document.getElementById('memeSubmission').style.display = 'block';
+      const editor = document.getElementById('profileEditor');
+      if (editor) {
+        editor.classList.remove('show');
+      }
+      profileEditorOpen = false;
         }
         
         function showLoginInterface() {
@@ -845,7 +1111,148 @@ function getHTML() {
             document.getElementById('loginBtn').textContent = 'SEND LOGIN CODE';
             document.getElementById('codeInput').value = '';
             pendingEmail = null;
+      const editor = document.getElementById('profileEditor');
+      if (editor) {
+        editor.classList.remove('show');
+      }
+      profileEditorOpen = false;
+      updateUserSummary();
         }
+
+    function updateUserSummary() {
+      const emailEl = document.getElementById('userEmail');
+      const handleEl = document.getElementById('userHandle');
+
+      if (!emailEl || !handleEl) {
+        return;
+      }
+
+      if (!currentUser) {
+        emailEl.textContent = '';
+        handleEl.textContent = '';
+        handleEl.classList.remove('missing');
+        return;
+      }
+
+            const namePart = currentUser.name ? currentUser.name + ' (' + currentUser.email + ')' : currentUser.email;
+      emailEl.textContent = 'Logged in as: ' + namePart;
+
+      if (currentUser.username) {
+        handleEl.textContent = '@' + currentUser.username;
+        handleEl.classList.remove('missing');
+      } else {
+        handleEl.textContent = 'Choose a username so others can find you';
+        handleEl.classList.add('missing');
+      }
+
+      const input = document.getElementById('usernameInput');
+      if (input && !profileEditorOpen) {
+        input.value = currentUser.username || '';
+      }
+    }
+
+    function toggleProfileEditor(open) {
+      if (!currentUser) {
+        return;
+      }
+
+      profileEditorOpen = open;
+      const editor = document.getElementById('profileEditor');
+      const input = document.getElementById('usernameInput');
+      const messageDiv = document.getElementById('profileMessage');
+
+      if (!editor || !input || !messageDiv) {
+        return;
+      }
+
+      if (open) {
+        editor.classList.add('show');
+        input.value = currentUser.username || buildUsernameSuggestion();
+        input.focus();
+        input.select();
+        messageDiv.innerHTML = '';
+      } else {
+        editor.classList.remove('show');
+        messageDiv.innerHTML = '';
+        input.value = currentUser ? currentUser.username || '' : '';
+      }
+    }
+
+    function buildUsernameSuggestion() {
+      const adjective = usernameAdjectives[Math.floor(Math.random() * usernameAdjectives.length)];
+      const noun = usernameNouns[Math.floor(Math.random() * usernameNouns.length)];
+      const suffix = Math.floor(100 + Math.random() * 900);
+            return adjective + '-' + noun + '-' + suffix;
+    }
+
+    function suggestUsername() {
+      const input = document.getElementById('usernameInput');
+      const messageDiv = document.getElementById('profileMessage');
+      if (!input || !messageDiv) {
+        return;
+      }
+      input.value = buildUsernameSuggestion();
+      messageDiv.innerHTML = '';
+      input.focus();
+      input.select();
+    }
+
+    async function saveUsername() {
+      if (!currentUser) {
+        return;
+      }
+
+      const input = document.getElementById('usernameInput');
+      const messageDiv = document.getElementById('profileMessage');
+      const saveBtn = document.getElementById('saveUsernameBtn');
+
+      if (!input || !messageDiv || !saveBtn) {
+        return;
+      }
+
+      const candidate = input.value.trim().toLowerCase();
+
+      if (!candidate) {
+        messageDiv.innerHTML = '<div class="error">Enter a username before saving.</div>';
+        return;
+      }
+
+      saveBtn.disabled = true;
+      messageDiv.innerHTML = '';
+
+      try {
+        const response = await fetch('/api/profile', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: candidate })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data?.profile) {
+          currentUser.username = data.profile.username;
+          if (data.profile.name) {
+            currentUser.name = data.profile.name;
+          }
+          updateUserSummary();
+          messageDiv.innerHTML = '<div class="success">Username updated!</div>';
+          setTimeout(() => {
+            if (profileEditorOpen) {
+              toggleProfileEditor(false);
+            }
+          }, 800);
+          await loadMemes();
+        } else {
+                    const errorMsg = (data && data.error) ? data.error : 'Failed to update username';
+                    messageDiv.innerHTML = '<div class="error">' + errorMsg + '</div>';
+        }
+      } catch (error) {
+        console.error('Username update failed:', error);
+        messageDiv.innerHTML = '<div class="error">Network error. Please try again.</div>';
+      } finally {
+        saveBtn.disabled = false;
+      }
+    }
         
         async function requestLogin() {
             const email = document.getElementById('emailInput').value.trim();
@@ -1139,7 +1546,7 @@ function getHTML() {
             
             memes.forEach(meme => {
                 const interactionCount = meme.interactions?.length || meme.interaction_count || 0;
-                const authorName = meme.author_name || meme.author || 'Anonymous';
+        const authorDisplay = meme.author_username ? '@' + meme.author_username : (meme.author_name || meme.author || meme.author_email || 'Anonymous');
                 
                 const memeDiv = document.createElement('div');
                 memeDiv.className = 'meme-item';
@@ -1149,12 +1556,12 @@ function getHTML() {
                 if (meme.interactions && meme.interactions.length > 0) {
                     interactionsHtml = '<div class="interactions-list">';
                     meme.interactions.slice(0, 3).forEach(interaction => {
-                        const userName = interaction.user_name || 'Anonymous';
+            const userName = interaction.user_username ? '@' + interaction.user_username : (interaction.user_name || 'Anonymous');
                         const typeColor = interaction.type === 'refute' ? '#d32f2f' : 
                                          interaction.type === 'refine' ? '#1976d2' : '#388e3c';
                         interactionsHtml += 
                             '<div class="interaction-item">' +
-                                '<strong style="color: ' + typeColor + '">' + interaction.type.toUpperCase() + '</strong> by ' + userName + ': ' + 
+                '<strong style="color: ' + typeColor + '">' + interaction.type.toUpperCase() + '</strong> by ' + userName + ': ' + 
                                 (interaction.comment || 'No comment') +
                             '</div>';
                     });
@@ -1172,7 +1579,7 @@ function getHTML() {
                 const htmlContent = '<div class="meme-score">' + meme.score + '</div>' +
                     '<div class="meme-content">' + meme.content + '</div>' +
                     '<div class="meme-meta">' +
-                        'By ' + authorName + ' • ' + formatTimeAgo(meme.created_at) + ' • ' + interactionCount + ' interactions' +
+            'By ' + authorDisplay + ' • ' + formatTimeAgo(meme.created_at) + ' • ' + interactionCount + ' interactions' +
                     '</div>' +
                     '<div class="meme-actions">' +
                         '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE (-15)</button>' +
