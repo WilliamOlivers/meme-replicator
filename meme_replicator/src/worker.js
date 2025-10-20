@@ -257,6 +257,28 @@ async function handleAPI(request, env, path) {
       });
     }
 
+    if (path === '/api/suggestions' && request.method === 'POST') {
+      const body = await request.json();
+      const message = typeof body.message === 'string' ? body.message.trim() : '';
+      const contact = typeof body.contact === 'string' ? body.contact.trim() : '';
+
+      if (message.length < 10) {
+        return new Response(JSON.stringify({ error: 'Suggestion is too short to act on.' }), {
+          status: 400,
+          headers: corsHeaders
+        });
+      }
+
+      const storedContact = contact || (currentUser ? currentUser.email : null);
+
+      await env.DB.prepare(`
+        INSERT INTO suggestions (user_id, contact, message, created_at)
+        VALUES (?, ?, ?, datetime('now'))
+      `).bind(currentUser ? currentUser.id : null, storedContact, message).run();
+
+      return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+    }
+
     if (path === '/api/memes' && request.method === 'GET') {
       // Get all memes with interactions
       const memes = await env.DB.prepare(`
@@ -846,6 +868,53 @@ function getHTML() {
       color: #666;
       margin: 0;
     }
+
+    .suggestion-section {
+      background: white;
+      border: 2px solid #333;
+      padding: 20px;
+      margin-top: 30px;
+    }
+
+    .suggestion-section h3 {
+      margin-top: 0;
+    }
+
+    .suggestion-copy {
+      color: #666;
+      font-size: 14px;
+      margin-bottom: 15px;
+    }
+
+    .suggestion-section textarea {
+      width: 100%;
+      height: 90px;
+      border: 1px solid #333;
+      padding: 10px;
+      font-family: inherit;
+      resize: vertical;
+      box-sizing: border-box;
+      margin-bottom: 10px;
+    }
+
+    .suggestion-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .suggestion-controls input[type="text"] {
+      flex: 1 1 220px;
+      min-width: 200px;
+      border: 1px solid #333;
+      padding: 8px 10px;
+      font-family: inherit;
+    }
+
+    .suggestion-controls button {
+      margin: 0;
+    }
         
         .meme-list {
             background: white;
@@ -1016,7 +1085,7 @@ function getHTML() {
     </div>
     <p class="profile-hint">Usernames use lowercase letters, numbers, and single hyphens.</p>
   </div>
-    
+
     <div class="meme-form">
         <h3>Submit a Meme (Idea)</h3>
         <div id="loginPrompt" style="display: none;">
@@ -1039,9 +1108,25 @@ function getHTML() {
             <button class="sort-btn" onclick="sortMemes('interactions')">ACTIVITY</button>
         </div>
         
-        <div id="memeContainer" class="loading">
-            Loading memes...
-        </div>
+    <div id="memeContainer" class="loading">
+      Loading memes...
+    </div>
+  </div>
+
+  <div style="text-align: center; margin-top: 20px;">
+    <a href="#" onclick="openSuggestionPanel(); return false;" style="color: #1976d2; text-decoration: none;">Make a suggestion →</a>
+  </div>
+
+  <div id="suggestionPanel" class="suggestion-section" style="display: none;">
+    <h3>Suggest Improvements</h3>
+    <p class="suggestion-copy">Tell us how Meme Replicator could be sharper, friendlier, or more powerful.</p>
+    <textarea id="suggestionInput" placeholder="Share your idea..."></textarea>
+    <div class="suggestion-controls">
+      <input type="text" id="suggestionContact" placeholder="Contact (optional)">
+      <button id="suggestionBtn" onclick="submitSuggestion()">SEND SUGGESTION</button>
+      <button onclick="closeSuggestionPanel()">CANCEL</button>
+    </div>
+    <div id="suggestionStatus"></div>
     </div>
 
     <script>
@@ -1050,6 +1135,7 @@ function getHTML() {
     let currentUser = null;
     let pendingEmail = null;
     let profileEditorOpen = false;
+  let suggestionStatusTimeout = null;
 
     const usernameAdjectives = [
       'curious', 'bold', 'clever', 'lively', 'radiant', 'vivid', 'brisk', 'lucid', 'noble', 'brave',
@@ -1060,6 +1146,38 @@ function getHTML() {
       'aurora', 'comet', 'nebula', 'quark', 'vector', 'cipher', 'vertex', 'lyric', 'signal', 'riddle',
       'lemma', 'paradox', 'chorus', 'atlas', 'glyph', 'spark', 'syllable', 'fractal', 'zephyr', 'ember'
     ];
+
+  const suggestionContactInput = document.getElementById('suggestionContact');
+  if (suggestionContactInput) {
+    suggestionContactInput.dataset.autofill = suggestionContactInput.dataset.autofill || 'false';
+    suggestionContactInput.addEventListener('input', () => {
+      suggestionContactInput.dataset.autofill = 'false';
+    });
+  }
+
+  function scheduleSuggestionStatusClear() {
+    const statusDiv = document.getElementById('suggestionStatus');
+    if (!statusDiv) {
+      return;
+    }
+
+    if (suggestionStatusTimeout) {
+      clearTimeout(suggestionStatusTimeout);
+    }
+
+    if (!statusDiv.innerHTML || statusDiv.innerHTML.trim() === '') {
+      suggestionStatusTimeout = null;
+      return;
+    }
+
+    suggestionStatusTimeout = setTimeout(() => {
+      const target = document.getElementById('suggestionStatus');
+      if (target) {
+        target.innerHTML = '';
+      }
+      suggestionStatusTimeout = null;
+    }, 6000);
+  }
         
         // Load initial state
         checkAuthAndLoad();
@@ -1131,6 +1249,14 @@ function getHTML() {
         emailEl.textContent = '';
         handleEl.textContent = '';
         handleEl.classList.remove('missing');
+        const contactInput = document.getElementById('suggestionContact');
+        if (contactInput) {
+          if (contactInput.dataset.autofill !== 'false') {
+            contactInput.value = '';
+          }
+          contactInput.placeholder = 'Contact (optional)';
+          contactInput.dataset.autofill = 'false';
+        }
         return;
       }
 
@@ -1148,6 +1274,17 @@ function getHTML() {
       const input = document.getElementById('usernameInput');
       if (input && !profileEditorOpen) {
         input.value = currentUser.username || '';
+      }
+
+      const contactInput = document.getElementById('suggestionContact');
+      if (contactInput) {
+        const userEdited = contactInput.dataset.autofill === 'false' && contactInput.value !== '';
+        const email = currentUser.email || '';
+        contactInput.placeholder = email || 'Contact (optional)';
+        if (!userEdited) {
+          contactInput.value = email;
+          contactInput.dataset.autofill = email ? 'true' : 'false';
+        }
       }
     }
 
@@ -1497,6 +1634,127 @@ function getHTML() {
                 submitBtn.textContent = 'Submit ' + type.charAt(0).toUpperCase() + type.slice(1);
             }
         }
+
+    function openSuggestionPanel() {
+      const panel = document.getElementById('suggestionPanel');
+      if (!panel) {
+        return;
+      }
+      panel.style.display = 'block';
+      panel.classList.remove('submitted');
+      const messageInput = document.getElementById('suggestionInput');
+      if (messageInput) {
+        messageInput.focus();
+      }
+    }
+
+    function closeSuggestionPanel() {
+      const panel = document.getElementById('suggestionPanel');
+      if (!panel) {
+        return;
+      }
+      panel.style.display = 'none';
+      panel.classList.remove('submitted');
+      const statusDiv = document.getElementById('suggestionStatus');
+      if (statusDiv) {
+        statusDiv.innerHTML = '';
+      }
+    }
+
+    async function submitPraise(memeId) {
+      if (!currentUser) {
+        alert('Please login to interact with memes!');
+        return;
+      }
+
+      const button = document.getElementById('praise-btn-' + memeId);
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'PRAISING...';
+      }
+
+      try {
+        const response = await fetch('/api/interactions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meme_id: memeId, type: 'praise', comment: '' })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+          await loadMemes();
+        } else {
+          const errorMsg = (data && data.error) ? data.error : 'Failed to submit praise';
+          alert(errorMsg);
+        }
+      } catch (error) {
+        console.error('Error submitting praise:', error);
+        alert('Network error. Please try again.');
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = 'PRAISE (+5)';
+        }
+      }
+    }
+
+    async function submitSuggestion() {
+      const messageInput = document.getElementById('suggestionInput');
+      const contactInput = document.getElementById('suggestionContact');
+      const statusDiv = document.getElementById('suggestionStatus');
+      const submitBtn = document.getElementById('suggestionBtn');
+
+      if (!messageInput || !statusDiv || !submitBtn) {
+        return;
+      }
+
+      const message = messageInput.value.trim();
+      const contact = contactInput ? contactInput.value.trim() : '';
+
+      if (message.length < 10) {
+        statusDiv.innerHTML = '<div class="error">Please share a bit more detail so we can act on it.</div>';
+        scheduleSuggestionStatusClear();
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'SENDING...';
+      statusDiv.innerHTML = '';
+
+      try {
+        const response = await fetch('/api/suggestions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, contact })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+          statusDiv.innerHTML = '<div class="success">Suggestion received—thanks for helping improve Meme Replicator!</div>';
+          messageInput.value = '';
+          if (!currentUser && contactInput) {
+            contactInput.value = '';
+          }
+          const panel = document.getElementById('suggestionPanel');
+          if (panel) {
+            panel.classList.add('submitted');
+          }
+          scheduleSuggestionStatusClear();
+        } else {
+          const errorMsg = (data && data.error) ? data.error : 'Failed to send suggestion';
+          statusDiv.innerHTML = '<div class="error">' + errorMsg + '</div>';
+        }
+      } catch (error) {
+        console.error('Suggestion submission failed:', error);
+        statusDiv.innerHTML = '<div class="error">Network error. Please try again.</div>';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'SEND SUGGESTION';
+        scheduleSuggestionStatusClear();
+      }
+    }
         
         function sortMemes(sortType) {
             currentSort = sortType;
@@ -1576,16 +1834,16 @@ function getHTML() {
                 const disabledAttr = canInteract ? '' : 'disabled';
                 const disabledTitle = canInteract ? '' : 'title="Login required"';
                 
-                const htmlContent = '<div class="meme-score">' + meme.score + '</div>' +
-                    '<div class="meme-content">' + meme.content + '</div>' +
-                    '<div class="meme-meta">' +
+        const htmlContent = '<div class="meme-score">' + meme.score + '</div>' +
+          '<div class="meme-content">' + meme.content + '</div>' +
+          '<div class="meme-meta">' +
             'By ' + authorDisplay + ' • ' + formatTimeAgo(meme.created_at) + ' • ' + interactionCount + ' interactions' +
-                    '</div>' +
-                    '<div class="meme-actions">' +
-                        '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE (-15)</button>' +
-                        '<button class="action-btn refine" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refine'" + ')">REFINE (+10)</button>' +
-                        '<button class="action-btn praise" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'praise'" + ')">PRAISE (+5)</button>' +
-                    '</div>' +
+          '</div>' +
+          '<div class="meme-actions">' +
+            '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE (-15)</button>' +
+            '<button class="action-btn refine" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refine'" + ')">REFINE (+10)</button>' +
+            '<button id="praise-btn-' + meme.id + '" class="action-btn praise" ' + disabledAttr + ' ' + disabledTitle + ' onclick="submitPraise(' + meme.id + ')">PRAISE (+5)</button>' +
+          '</div>' +
                     
                     '<div id="form-' + meme.id + '-refute" class="interaction-form">' +
                         '<textarea id="comment-' + meme.id + '-refute" placeholder="Explain why this meme is flawed or incorrect..."></textarea>' +
@@ -1595,11 +1853,6 @@ function getHTML() {
                     '<div id="form-' + meme.id + '-refine" class="interaction-form">' +
                         '<textarea id="comment-' + meme.id + '-refine" placeholder="How can this meme be improved or made more precise..."></textarea>' +
                         '<button id="submit-' + meme.id + '-refine" onclick="submitInteraction(' + meme.id + ', ' + "'refine'" + ')">Submit Refinement</button>' +
-                    '</div>' +
-                    
-                    '<div id="form-' + meme.id + '-praise" class="interaction-form">' +
-                        '<textarea id="comment-' + meme.id + '-praise" placeholder="Why is this meme valuable or insightful..."></textarea>' +
-                        '<button id="submit-' + meme.id + '-praise" onclick="submitInteraction(' + meme.id + ', ' + "'praise'" + ')">Submit Praise</button>' +
                     '</div>' +
                     
                     interactionsHtml;
