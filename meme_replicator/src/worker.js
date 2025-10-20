@@ -15,9 +15,9 @@ export default {
       });
     }
     
-    // Handle magic link authentication
-    if (path === '/auth' && url.searchParams.has('token')) {
-      return handleMagicLink(request, env, url.searchParams.get('token'));
+    // Handle Auth0 callback
+    if (path === '/auth/callback') {
+      return handleAuth0Callback(request, env);
     }
     
     // 404 for other routes
@@ -25,52 +25,60 @@ export default {
   }
 };
 
-async function handleMagicLink(request, env, token) {
+async function handleAuth0Callback(request, env) {
   try {
-    // Find valid token
-    const authToken = await env.DB.prepare(`
-      SELECT at.*, u.email, u.name, u.id as user_id
-      FROM auth_tokens at
-      JOIN users u ON at.user_id = u.id
-      WHERE at.token = ? AND at.expires_at > datetime('now') AND at.used = FALSE
-    `).bind(token).first();
+    const url = new URL(request.url);
+    const code = url.searchParams.get('code');
     
-    if (!authToken) {
-      return new Response(getAuthErrorHTML('Invalid or expired login link'), {
-        headers: { 'Content-Type': 'text/html' }
-      });
+    if (!code) {
+      return new Response('Missing authorization code', { status: 400 });
     }
     
-    // Mark token as used
-    await env.DB.prepare('UPDATE auth_tokens SET used = TRUE WHERE token = ?').bind(token).run();
+    // Exchange code for token
+    const tokenResponse = await fetch(`https://${env.AUTH0_DOMAIN}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: env.AUTH0_CLIENT_ID,
+        client_secret: env.AUTH0_CLIENT_SECRET,
+        code: code,
+        grant_type: 'authorization_code',
+        redirect_uri: `${env.SITE_URL}auth/callback`
+      })
+    });
     
-    // Update last login
-    await env.DB.prepare('UPDATE users SET last_login = datetime("now") WHERE id = ?').bind(authToken.user_id).run();
+    if (!tokenResponse.ok) {
+      console.error('Token exchange failed:', await tokenResponse.text());
+      return new Response('Authentication failed', { status: 401 });
+    }
     
-    // Create session cookie (simple JWT-like token, valid for 30 days)
-    const sessionData = {
-      userId: authToken.user_id,
-      email: authToken.email,
-      name: authToken.name,
-      exp: Date.now() + (30 * 24 * 60 * 60 * 1000) // 30 days
-    };
+    const tokenData = await tokenResponse.json();
+    const accessToken = tokenData.access_token;
     
-    const sessionToken = btoa(JSON.stringify(sessionData));
+    // Get user info from Auth0
+    const userResponse = await fetch(`https://${env.AUTH0_DOMAIN}/userinfo`, {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
     
-    // Redirect to home with session cookie
+    if (!userResponse.ok) {
+      return new Response('Failed to get user info', { status: 401 });
+    }
+    
+    const auth0User = await userResponse.json();
+    const user = await upsertAuth0User(auth0User, env);
+    const sessionDetails = buildSessionCookie(user, auth0User);
+    
     return new Response(null, {
       status: 302,
       headers: {
         'Location': '/',
-        'Set-Cookie': `session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${30 * 24 * 60 * 60}`
+        'Set-Cookie': sessionDetails.header
       }
     });
     
   } catch (error) {
-    console.error('Auth error:', error);
-    return new Response(getAuthErrorHTML('Authentication failed'), {
-      headers: { 'Content-Type': 'text/html' }
-    });
+    console.error('Auth0 callback error:', error);
+    return new Response('Authentication error: ' + error.message, { status: 500 });
   }
 }
 
@@ -96,10 +104,15 @@ async function getUserFromRequest(request, env) {
 }
 
 async function handleAPI(request, env, path) {
+  const origin = request.headers.get('Origin');
+  const siteOrigin = env.SITE_URL ? env.SITE_URL.replace(/\/$/, '') : undefined;
+  const allowedOrigin = origin && origin !== 'null' ? origin : siteOrigin || '*';
+
   const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Credentials': 'true',
     'Content-Type': 'application/json'
   };
   
@@ -112,6 +125,10 @@ async function handleAPI(request, env, path) {
     // Auth endpoints
     if (path === '/api/auth/login' && request.method === 'POST') {
       return handleLogin(request, env, corsHeaders);
+    }
+
+    if (path === '/api/auth/verify' && request.method === 'POST') {
+      return handleCodeVerification(request, env, corsHeaders);
     }
     
     if (path === '/api/auth/user' && request.method === 'GET') {
@@ -267,77 +284,207 @@ async function handleLogin(request, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'Valid email required' }), 
         { status: 400, headers: corsHeaders });
     }
+    // Request Auth0 to send a passwordless email link
+    const payload = {
+      client_id: env.AUTH0_CLIENT_ID,
+      client_secret: env.AUTH0_CLIENT_SECRET,
+      connection: 'email',
+      email,
+      send: 'code'
+    };
     
-    // Find or create user
-    let user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
+    const authResponse = await fetch(`https://${env.AUTH0_DOMAIN}/passwordless/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
     
-    if (!user) {
-      const result = await env.DB.prepare(`
-        INSERT INTO users (email, created_at) VALUES (?, datetime('now'))
-      `).bind(email).run();
-      
-      user = { id: result.meta.last_row_id, email };
-    }
-    
-    // Generate magic link token
-    const token = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 minutes
-    
-    await env.DB.prepare(`
-      INSERT INTO auth_tokens (user_id, token, expires_at, created_at)
-      VALUES (?, ?, ?, datetime('now'))
-    `).bind(user.id, token, expiresAt).run();
-    
-    // Send email (you'll need to implement this based on your email service)
-    const magicLink = `${env.SITE_URL}/auth?token=${token}`;
-    const emailSent = await sendMagicLinkEmail(email, magicLink, env);
-    
-    if (!emailSent) {
-      return new Response(JSON.stringify({ error: 'Failed to send email' }), 
-        { status: 500, headers: corsHeaders });
+    if (!authResponse.ok) {
+      const errorText = await authResponse.text();
+      console.error('Auth0 passwordless start failed:', errorText);
+      return new Response(JSON.stringify({ error: 'Failed to send login email. Please try again.' }), 
+        { status: 502, headers: corsHeaders });
     }
     
     return new Response(JSON.stringify({ 
-      success: true, 
-      message: 'Magic link sent to your email' 
+      success: true,
+      message: 'Verification code sent. Check your email.'
     }), { headers: corsHeaders });
     
   } catch (error) {
     console.error('Login error:', error);
-    return new Response(JSON.stringify({ error: 'Login failed' }), 
+    return new Response(JSON.stringify({ error: 'Login failed: ' + error.message }), 
       { status: 500, headers: corsHeaders });
   }
 }
 
-async function sendMagicLinkEmail(email, magicLink, env) {
+async function handleCodeVerification(request, env, corsHeaders) {
   try {
-    // Using Resend as an example - replace with your preferred email service
-    const response = await fetch('https://api.resend.com/emails', {
+    const { email, code } = await request.json();
+
+    if (!email || !email.includes('@') || !code) {
+      return new Response(JSON.stringify({ error: 'Email and verification code are required.' }), {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    const tokenResponse = await fetch(`https://${env.AUTH0_DOMAIN}/oauth/token`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        from: env.FROM_EMAIL,
-        to: email,
-        subject: 'Login to Meme Replicator',
-        html: `
-          <h2>Login to Meme Replicator</h2>
-          <p>Click the link below to login:</p>
-          <p><a href="${magicLink}" style="background: #333; color: white; padding: 10px 20px; text-decoration: none;">Login to Meme Replicator</a></p>
-          <p>This link expires in 15 minutes.</p>
-          <p>If you didn't request this login, you can safely ignore this email.</p>
-        `
+        grant_type: 'http://auth0.com/oauth/grant-type/passwordless/otp',
+        client_id: env.AUTH0_CLIENT_ID,
+        client_secret: env.AUTH0_CLIENT_SECRET,
+        otp: code,
+        realm: 'email',
+        username: email,
+        scope: 'openid profile email'
       })
     });
-    
-    return response.ok;
+
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      console.error('Auth0 OTP exchange failed:', errorText);
+      return new Response(JSON.stringify({ error: 'Invalid or expired verification code.' }), {
+        status: 401,
+        headers: corsHeaders
+      });
+    }
+
+    const tokenData = await tokenResponse.json();
+    let auth0User = null;
+
+    if (tokenData.access_token) {
+      const userResponse = await fetch(`https://${env.AUTH0_DOMAIN}/userinfo`, {
+        headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+      });
+
+      if (!userResponse.ok) {
+        console.error('Failed to fetch user info after OTP exchange:', await userResponse.text());
+        return new Response(JSON.stringify({ error: 'Verification succeeded but user info is unavailable.' }), {
+          status: 500,
+          headers: corsHeaders
+        });
+      }
+
+      auth0User = await userResponse.json();
+    } else if (tokenData.id_token) {
+      const decoded = decodeIdToken(tokenData.id_token);
+      if (decoded) {
+        auth0User = decoded;
+      }
+    }
+
+    if (!auth0User || !auth0User.email) {
+      // Fallback to the email the user provided if Auth0 response omits it
+      auth0User = {
+        ...(auth0User || {}),
+        email,
+        name: auth0User?.name || auth0User?.nickname || email
+      };
+    }
+
+    const user = await upsertAuth0User(auth0User, env);
+    const sessionDetails = buildSessionCookie(user, auth0User);
+
+    return new Response(JSON.stringify({ success: true }), {
+      headers: {
+        ...corsHeaders,
+        'Set-Cookie': sessionDetails.header
+      }
+    });
+
   } catch (error) {
-    console.error('Email sending error:', error);
-    return false;
+    console.error('Code verification error:', error);
+    return new Response(JSON.stringify({ error: 'Verification failed: ' + error.message }), {
+      status: 500,
+      headers: corsHeaders
+    });
   }
 }
+
+async function upsertAuth0User(auth0User, env) {
+  if (!auth0User || !auth0User.email) {
+    throw new Error('Auth0 profile missing email');
+  }
+
+  const preferredName = auth0User.name || auth0User.nickname || auth0User.email;
+
+  let user = await env.DB.prepare('SELECT * FROM users WHERE email = ?')
+    .bind(auth0User.email)
+    .first();
+
+  if (!user) {
+    const result = await env.DB.prepare(`
+      INSERT INTO users (email, name, created_at)
+      VALUES (?, ?, datetime('now'))
+    `).bind(auth0User.email, preferredName).run();
+
+    user = {
+      id: result.meta.last_row_id,
+      email: auth0User.email,
+      name: preferredName
+    };
+  } else if (!user.name && preferredName) {
+    await env.DB.prepare('UPDATE users SET name = ? WHERE id = ?')
+      .bind(preferredName, user.id)
+      .run();
+    user.name = preferredName;
+  }
+
+  await env.DB.prepare('UPDATE users SET last_login = datetime("now") WHERE id = ?')
+    .bind(user.id)
+    .run();
+
+  return user;
+}
+
+function buildSessionCookie(user, auth0User) {
+  const displayName = user.name || auth0User?.name || auth0User?.nickname || user.email;
+  const sessionData = {
+    userId: user.id,
+    email: user.email,
+    name: displayName,
+    auth0Sub: auth0User?.sub,
+    exp: Date.now() + (30 * 24 * 60 * 60 * 1000)
+  };
+
+  const sessionToken = btoa(JSON.stringify(sessionData));
+  const maxAgeSeconds = 30 * 24 * 60 * 60;
+
+  return {
+    token: sessionToken,
+    header: `session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSeconds}`
+  };
+}
+
+function decodeIdToken(idToken) {
+  try {
+    const parts = idToken.split('.');
+    if (parts.length < 2) {
+      return null;
+    }
+
+    const payload = base64UrlDecode(parts[1]);
+    return JSON.parse(payload);
+  } catch (error) {
+    console.error('Failed to decode id_token:', error);
+    return null;
+  }
+}
+
+function base64UrlDecode(input) {
+  let output = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = output.length % 4;
+
+  if (padding) {
+    output += '='.repeat(4 - padding);
+  }
+
+  return atob(output);
+}
+
 
 function getAuthErrorHTML(message) {
   return `<!DOCTYPE html>
@@ -603,9 +750,14 @@ function getHTML() {
     <!-- Authentication Section -->
     <div id="authSection" class="auth-section">
         <h3>Login to Submit & Interact</h3>
-        <p>Enter your email to receive a magic login link:</p>
+    <p>Enter your email to receive a one-time login code:</p>
         <input type="email" id="emailInput" placeholder="your@email.com">
-        <button id="loginBtn" onclick="requestLogin()">SEND LOGIN LINK</button>
+    <button id="loginBtn" onclick="requestLogin()">SEND LOGIN CODE</button>
+    <div id="codeSection" style="display: none; margin-top: 15px;">
+      <p>Then enter the 6-digit code we just emailed you:</p>
+      <input type="text" id="codeInput" maxlength="10" placeholder="123456" style="width: 160px; text-align: center;">
+      <button id="verifyBtn" onclick="verifyCode()">VERIFY CODE</button>
+    </div>
         <div id="authMessage"></div>
     </div>
     
@@ -646,6 +798,7 @@ function getHTML() {
         let memes = [];
         let currentSort = 'score';
         let currentUser = null;
+  let pendingEmail = null;
         
         // Load initial state
         checkAuthAndLoad();
@@ -686,44 +839,125 @@ function getHTML() {
             document.getElementById('userInfo').classList.remove('show');
             document.getElementById('loginPrompt').style.display = 'block';
             document.getElementById('memeSubmission').style.display = 'none';
+            document.getElementById('codeSection').style.display = 'none';
+            document.getElementById('emailInput').disabled = false;
+            document.getElementById('loginBtn').disabled = false;
+            document.getElementById('loginBtn').textContent = 'SEND LOGIN CODE';
+            document.getElementById('codeInput').value = '';
+            pendingEmail = null;
         }
         
         async function requestLogin() {
             const email = document.getElementById('emailInput').value.trim();
             const loginBtn = document.getElementById('loginBtn');
             const messageDiv = document.getElementById('authMessage');
-            
+            const emailInput = document.getElementById('emailInput');
+            const codeSection = document.getElementById('codeSection');
+            const codeInput = document.getElementById('codeInput');
+
             if (!email || !email.includes('@')) {
                 messageDiv.innerHTML = '<div class="error">Please enter a valid email address!</div>';
                 return;
             }
-            
+
             loginBtn.disabled = true;
-            loginBtn.textContent = 'SENDING...';
+            loginBtn.textContent = 'SENDING LOGIN CODE...';
             messageDiv.innerHTML = '';
-            
+
             try {
                 const response = await fetch('/api/auth/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email })
                 });
-                
+
                 const data = await response.json();
-                
+
                 if (data.success) {
-                    messageDiv.innerHTML = '<div class="success">Magic link sent! Check your email.</div>';
-                    document.getElementById('emailInput').value = '';
+                    pendingEmail = email;
+                    emailInput.disabled = true;
+                    messageDiv.innerHTML = '<div class="success">' + (data.message || 'Check your email for the 6-digit verification code!') + '</div>';
+                    loginBtn.textContent = 'EMAIL SENT!';
+                    codeSection.style.display = 'block';
+          codeInput.value = '';
+                    codeInput.focus();
+                    setTimeout(() => {
+                        loginBtn.disabled = false;
+                        loginBtn.textContent = 'SEND LOGIN CODE';
+                    }, 5000);
                 } else {
                     messageDiv.innerHTML = '<div class="error">' + (data.error || 'Login failed') + '</div>';
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'SEND LOGIN CODE';
+                    pendingEmail = null;
+                    emailInput.disabled = false;
+                    codeSection.style.display = 'none';
                 }
-                
+
             } catch (error) {
                 messageDiv.innerHTML = '<div class="error">Network error. Please try again.</div>';
                 console.error('Login error:', error);
-            } finally {
                 loginBtn.disabled = false;
-                loginBtn.textContent = 'SEND LOGIN LINK';
+                loginBtn.textContent = 'SEND LOGIN CODE';
+                pendingEmail = null;
+                emailInput.disabled = false;
+                codeSection.style.display = 'none';
+            }
+        }
+        async function verifyCode() {
+            const codeInput = document.getElementById('codeInput');
+            const verifyBtn = document.getElementById('verifyBtn');
+            const messageDiv = document.getElementById('authMessage');
+            const emailInput = document.getElementById('emailInput');
+            const codeSection = document.getElementById('codeSection');
+            const code = codeInput.value.trim();
+            
+            if (!pendingEmail) {
+                messageDiv.innerHTML = '<div class="error">Please request a code first.</div>';
+                return;
+            }
+            
+            if (!code) {
+                messageDiv.innerHTML = '<div class="error">Enter the verification code from your email.</div>';
+                return;
+            }
+            
+            verifyBtn.disabled = true;
+            verifyBtn.textContent = 'VERIFYING...';
+            messageDiv.innerHTML = '';
+            
+            try {
+                const response = await fetch('/api/auth/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email: pendingEmail, code })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    messageDiv.innerHTML = '<div class="success">Verification successful! Redirecting...</div>';
+                    codeInput.value = '';
+                    pendingEmail = null;
+                    emailInput.disabled = false;
+                    emailInput.value = '';
+                    document.getElementById('loginBtn').disabled = false;
+                    document.getElementById('loginBtn').textContent = 'SEND LOGIN CODE';
+                    codeSection.style.display = 'none';
+                    verifyBtn.disabled = false;
+                    verifyBtn.textContent = 'VERIFY CODE';
+                    await checkAuth();
+                    await loadMemes();
+                } else {
+                    messageDiv.innerHTML = '<div class="error">' + (data.error || 'Verification failed. Please try again.') + '</div>';
+                    verifyBtn.disabled = false;
+                    verifyBtn.textContent = 'VERIFY CODE';
+                }
+            } catch (error) {
+                console.error('Verification error:', error);
+                messageDiv.innerHTML = '<div class="error">Verification failed. Please try again.</div>';
+                verifyBtn.disabled = false;
+                verifyBtn.textContent = 'VERIFY CODE';
             }
         }
         

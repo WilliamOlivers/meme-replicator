@@ -21,7 +21,7 @@ Visit: [https://meme-replicator.oliverpartridge.workers.dev/](https://meme-repli
 ## ✨ Features
 
 - **View memes without login** - Browse all ideas anonymously
-- **Email authentication** - Passwordless magic link login (when configured)
+- **Email authentication** - Passwordless Auth0 one-time codes
 - **Submit ideas** - Share your memes with the community
 - **Interact with memes** - REFUTE, REFINE, or PRAISE
 - **Fitness scoring** - Ideas evolve based on interactions
@@ -32,7 +32,7 @@ Visit: [https://meme-replicator.oliverpartridge.workers.dev/](https://meme-repli
 
 - **Runtime**: Cloudflare Workers
 - **Database**: Cloudflare D1 (SQLite)
-- **Email**: Resend API
+- **Authentication**: Auth0 Passwordless (email OTP)
 - **Deployment**: Wrangler CLI
 
 ## 📦 Setup
@@ -41,7 +41,7 @@ Visit: [https://meme-replicator.oliverpartridge.workers.dev/](https://meme-repli
 
 - Node.js (v20+)
 - A Cloudflare account
-- (Optional) Resend account for email authentication
+- Auth0 tenant with Passwordless Email enabled (see `AUTH0_SETUP.md`)
 
 ### Installation
 
@@ -74,17 +74,14 @@ Visit: [https://meme-replicator.oliverpartridge.workers.dev/](https://meme-repli
    ```
    Visit `http://localhost:8787`
 
-### Email Authentication Setup (Optional)
+### Auth0 Passwordless Setup
 
-To enable login functionality:
+Follow `AUTH0_SETUP.md` for detailed instructions. In summary you will:
 
-1. Sign up at [Resend](https://resend.com)
-2. Get your API key
-3. Set the secret:
-   ```bash
-   npx wrangler secret put RESEND_API_KEY
-   ```
-4. Update `FROM_EMAIL` in `wrangler.toml` with your verified domain
+1. Create an Auth0 Single Page Application
+2. Enable the **Passwordless > Email** connection
+3. Add your production and local callback URLs
+4. Set `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, and the `AUTH0_CLIENT_SECRET` Wrangler secret
 
 ## 🚢 Deployment
 
@@ -99,12 +96,6 @@ npx wrangler deploy
 ```bash
 npx wrangler d1 execute meme-replicator --remote --file=schema.sql
 npx wrangler d1 execute meme-replicator --remote --file=schema-auth.sql
-```
-
-### Set production secrets
-
-```bash
-npx wrangler secret put RESEND_API_KEY
 ```
 
 ## 📁 Project Structure
@@ -126,7 +117,7 @@ meme-replicator/
 
 - **memes** - Stores ideas with content, author, score, and timestamps
 - **users** - User accounts with email and metadata
-- **auth_tokens** - Magic link tokens for authentication
+- **auth_tokens** - Legacy table for magic link tokens (unused with Auth0 OTP)
 - **interactions** - User interactions (refute, refine, praise) with memes
 
 ## 🎯 Usage

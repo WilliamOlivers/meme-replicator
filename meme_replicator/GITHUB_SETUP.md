@@ -37,4 +37,4 @@ git push
 1. Your wrangler.toml contains environment variables but NO secrets
 2. The .gitignore properly excludes sensitive files
 3. Remember to update the README with your actual GitHub username and email
-4. Never commit your RESEND_API_KEY or other secrets!
+4. Never commit secrets like `AUTH0_CLIENT_SECRET`!

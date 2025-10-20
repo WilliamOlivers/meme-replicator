@@ -10,10 +10,11 @@ database_id = "289daca3-fc68-4823-9685-3f6d255c1b1d"
 
 [vars]
 SITE_URL = "https://meme-replicator.oliverpartridge.workers.dev/"
-FROM_EMAIL = "onboarding@resend.dev"
+AUTH0_DOMAIN = "dev-xluvqyrnc6lhmal6.us.auth0.com"
+AUTH0_CLIENT_ID = "LClYgO5vAbC8sbXFoZsgJoMbkxICiyA3"
 
-# Note: Using Resend's test email for now. This works without verification.
-# You still need to set RESEND_API_KEY secret if you want login to work:
-# wrangler secret put RESEND_API_KEY
+# Set these secrets:
+# wrangler secret put AUTH0_CLIENT_SECRET
 # 
-# But you can view memes WITHOUT logging in - login is only needed to submit/interact
+# Auth0 Configuration: https://manage.auth0.com
+# Enable: Passwordless > Email
