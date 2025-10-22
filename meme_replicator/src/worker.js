@@ -916,11 +916,51 @@ function getHTML() {
       margin: 0;
     }
         
+    .meme-area {
+      position: relative;
+    }
+
         .meme-list {
             background: white;
             border: 2px solid #333;
             padding: 20px;
         }
+
+    .meme-rank-note {
+      font-size: 12px;
+      color: #666;
+      margin: -10px 0 15px;
+      font-style: italic;
+    }
+
+    .meme-axis {
+  position: absolute;
+  top: 0;
+  right: -96px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 0;
+  min-width: 72px;
+  height: 100%;
+    }
+
+    .meme-axis-line {
+      flex: 1;
+      width: 2px;
+      background: #333;
+      margin: 12px 0;
+    }
+
+    .axis-label {
+      font-size: 11px;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: #555;
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+    }
+
         
         .meme-item {
             border-bottom: 1px solid #ddd;
@@ -932,7 +972,7 @@ function getHTML() {
             border-bottom: none;
         }
         
-        .meme-score {
+    .meme-rank {
             position: absolute;
             top: 15px;
             right: 0;
@@ -1103,10 +1143,18 @@ function getHTML() {
         <div id="submitMessage"></div>
     </div>
     
-  <div class="meme-list">
-    <h3>Meme Pool</h3>
-    <div id="memeContainer" class="loading">
-      Loading memes...
+  <div class="meme-area">
+    <div class="meme-list">
+      <h3>Meme Pool</h3>
+      <p class="meme-rank-note">Higher entries reflect more widely shared truth.</p>
+      <div id="memeContainer" class="loading">
+        Loading memes...
+      </div>
+    </div>
+    <div class="meme-axis" aria-hidden="true">
+      <span class="axis-label axis-top"> <- Higher shared truth</span>
+      <div class="meme-axis-line"></div>
+      <span class="axis-label axis-bottom">Lower shared truth -></span>
     </div>
   </div>
 
@@ -1691,7 +1739,7 @@ function getHTML() {
       } finally {
         if (button) {
           button.disabled = false;
-          button.textContent = 'PRAISE (+5)';
+          button.textContent = 'PRAISE';
         }
       }
     }
@@ -1781,7 +1829,7 @@ function getHTML() {
             
             container.innerHTML = '';
             
-            memes.forEach(meme => {
+            memes.forEach((meme, index) => {
                 const interactionCount = meme.interactions?.length || meme.interaction_count || 0;
         const authorDisplay = meme.author_username ? '@' + meme.author_username : (meme.author_name || meme.author || meme.author_email || 'Anonymous');
         const typeCounts = { refute: 0, refine: 0, praise: 0 };
@@ -1796,6 +1844,8 @@ function getHTML() {
                 
                 const memeDiv = document.createElement('div');
                 memeDiv.className = 'meme-item';
+
+        const rankPosition = index + 1;
                 
                 // Build interactions display
                 let interactionsHtml = '';
@@ -1805,10 +1855,12 @@ function getHTML() {
             const userName = interaction.user_username ? '@' + interaction.user_username : (interaction.user_name || 'Anonymous');
                         const typeColor = interaction.type === 'refute' ? '#d32f2f' : 
                                          interaction.type === 'refine' ? '#1976d2' : '#388e3c';
+            const commentText = interaction.comment && interaction.comment.trim()
+              ? ': ' + interaction.comment.trim()
+              : '';
                         interactionsHtml += 
                             '<div class="interaction-item">' +
-                '<strong style="color: ' + typeColor + '">' + interaction.type.toUpperCase() + '</strong> by ' + userName + ': ' + 
-                                (interaction.comment || 'No comment') +
+                '<strong style="color: ' + typeColor + '">' + interaction.type.toUpperCase() + '</strong> by ' + userName + commentText +
                             '</div>';
                     });
                     if (meme.interactions.length > 3) {
@@ -1822,22 +1874,22 @@ function getHTML() {
                 const disabledAttr = canInteract ? '' : 'disabled';
                 const disabledTitle = canInteract ? '' : 'title="Login required"';
                 
-        const htmlContent = '<div class="meme-score">' + meme.score + '</div>' +
+        const htmlContent = '<div class="meme-rank">' + rankPosition + '</div>' +
           '<div class="meme-content">' + meme.content + '</div>' +
           '<div class="meme-meta">' +
             'By ' + authorDisplay + ' • ' + formatTimeAgo(meme.created_at) + ' • ' + interactionCount + ' interactions' +
           '</div>' +
           '<div class="meme-actions">' +
             '<div class="action-wrapper">' +
-              '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE (-15)</button>' +
+              '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE</button>' +
               '<div class="action-count">' + typeCounts.refute + '</div>' +
             '</div>' +
             '<div class="action-wrapper">' +
-              '<button class="action-btn refine" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refine'" + ')">REFINE (+10)</button>' +
+              '<button class="action-btn refine" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refine'" + ')">REFINE</button>' +
               '<div class="action-count">' + typeCounts.refine + '</div>' +
             '</div>' +
             '<div class="action-wrapper">' +
-              '<button id="praise-btn-' + meme.id + '" class="action-btn praise" ' + disabledAttr + ' ' + disabledTitle + ' onclick="submitPraise(' + meme.id + ')">PRAISE (+5)</button>' +
+              '<button id="praise-btn-' + meme.id + '" class="action-btn praise" ' + disabledAttr + ' ' + disabledTitle + ' onclick="submitPraise(' + meme.id + ')">PRAISE</button>' +
               '<div class="action-count">' + typeCounts.praise + '</div>' +
             '</div>' +
           '</div>' +
