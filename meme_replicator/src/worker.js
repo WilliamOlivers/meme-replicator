@@ -954,9 +954,31 @@ function getHTML() {
             margin-top: 10px;
         }
         
-        .meme-actions {
-            margin-top: 10px;
-        }
+    .meme-actions {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 16px;
+    }
+
+    .action-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      min-width: 120px;
+    }
+
+    .action-wrapper button {
+      width: 100%;
+    }
+
+    .action-count {
+      font-size: 11px;
+      color: #666;
+      letter-spacing: 0.5px;
+    }
         
         .action-btn {
             background: transparent;
@@ -1002,24 +1024,6 @@ function getHTML() {
             margin-bottom: 5px;
             padding: 5px;
             background: #f9f9f9;
-        }
-        
-        .sort-controls {
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        
-        .sort-btn {
-            background: transparent;
-            border: 1px solid #333;
-            color: #333;
-            padding: 5px 15px;
-            margin: 0 5px;
-        }
-        
-        .sort-btn.active {
-            background: #333;
-            color: white;
         }
         
         .loading {
@@ -1099,15 +1103,8 @@ function getHTML() {
         <div id="submitMessage"></div>
     </div>
     
-    <div class="meme-list">
-        <h3>Meme Pool</h3>
-        <div class="sort-controls">
-            Sort by: 
-            <button class="sort-btn active" onclick="sortMemes('score')">FITNESS SCORE</button>
-            <button class="sort-btn" onclick="sortMemes('age')">AGE</button>
-            <button class="sort-btn" onclick="sortMemes('interactions')">ACTIVITY</button>
-        </div>
-        
+  <div class="meme-list">
+    <h3>Meme Pool</h3>
     <div id="memeContainer" class="loading">
       Loading memes...
     </div>
@@ -1130,8 +1127,7 @@ function getHTML() {
     </div>
 
     <script>
-    let memes = [];
-    let currentSort = 'score';
+  let memes = [];
     let currentUser = null;
     let pendingEmail = null;
     let profileEditorOpen = false;
@@ -1527,6 +1523,7 @@ function getHTML() {
                 
                 const data = await response.json();
                 memes = data;
+    sortMemes();
                 renderMemes();
             } catch (error) {
                 console.error('Error loading memes:', error);
@@ -1756,27 +1753,9 @@ function getHTML() {
       }
     }
         
-        function sortMemes(sortType) {
-            currentSort = sortType;
-            
-            // Update active button
-            document.querySelectorAll('.sort-btn').forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
-            
-            switch(sortType) {
-                case 'score':
-                    memes.sort((a, b) => b.score - a.score);
-                    break;
-                case 'age':
-                    memes.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-                    break;
-                case 'interactions':
-                    memes.sort((a, b) => (b.interactions?.length || 0) - (a.interactions?.length || 0));
-                    break;
-            }
-            
-            renderMemes();
-        }
+      function sortMemes() {
+        memes.sort((a, b) => b.score - a.score);
+      }
         
         function formatTimeAgo(dateString) {
             const now = new Date();
@@ -1805,6 +1784,15 @@ function getHTML() {
             memes.forEach(meme => {
                 const interactionCount = meme.interactions?.length || meme.interaction_count || 0;
         const authorDisplay = meme.author_username ? '@' + meme.author_username : (meme.author_name || meme.author || meme.author_email || 'Anonymous');
+        const typeCounts = { refute: 0, refine: 0, praise: 0 };
+
+        if (Array.isArray(meme.interactions)) {
+          meme.interactions.forEach(interaction => {
+            if (interaction && typeCounts.hasOwnProperty(interaction.type)) {
+              typeCounts[interaction.type] += 1;
+            }
+          });
+        }
                 
                 const memeDiv = document.createElement('div');
                 memeDiv.className = 'meme-item';
@@ -1840,9 +1828,18 @@ function getHTML() {
             'By ' + authorDisplay + ' • ' + formatTimeAgo(meme.created_at) + ' • ' + interactionCount + ' interactions' +
           '</div>' +
           '<div class="meme-actions">' +
-            '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE (-15)</button>' +
-            '<button class="action-btn refine" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refine'" + ')">REFINE (+10)</button>' +
-            '<button id="praise-btn-' + meme.id + '" class="action-btn praise" ' + disabledAttr + ' ' + disabledTitle + ' onclick="submitPraise(' + meme.id + ')">PRAISE (+5)</button>' +
+            '<div class="action-wrapper">' +
+              '<button class="action-btn refute" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refute'" + ')">REFUTE (-15)</button>' +
+              '<div class="action-count">' + typeCounts.refute + '</div>' +
+            '</div>' +
+            '<div class="action-wrapper">' +
+              '<button class="action-btn refine" ' + disabledAttr + ' ' + disabledTitle + ' onclick="interactWithMeme(' + meme.id + ', ' + "'refine'" + ')">REFINE (+10)</button>' +
+              '<div class="action-count">' + typeCounts.refine + '</div>' +
+            '</div>' +
+            '<div class="action-wrapper">' +
+              '<button id="praise-btn-' + meme.id + '" class="action-btn praise" ' + disabledAttr + ' ' + disabledTitle + ' onclick="submitPraise(' + meme.id + ')">PRAISE (+5)</button>' +
+              '<div class="action-count">' + typeCounts.praise + '</div>' +
+            '</div>' +
           '</div>' +
                     
                     '<div id="form-' + meme.id + '-refute" class="interaction-form">' +
